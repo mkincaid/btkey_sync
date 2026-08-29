@@ -11,12 +11,13 @@ from pathlib import Path
 from platform_detect import OSKind
 import tui_helpers as tui
 import actions_common as common
+from backends import LinuxBluetoothBackend
 from models import BondKey, LinkKeyBond
-from actions_verify import verify_and_connect
+from actions_verify import force_push_sync, verify_and_connect
 from actions_clone_loader import UnifiedDevice, load_windows_devices, load_linux_devices
 
 
-def _resolve_target_adapter(backend, src_adapter_mac: str) -> str | None:
+def _resolve_target_adapter(backend: LinuxBluetoothBackend, src_adapter_mac: str) -> str | None:
     """Finds or prompts for the local Linux Bluetooth adapter destination."""
     local_adapters = backend._list_adapters()
     if not local_adapters:
@@ -40,7 +41,7 @@ def _resolve_target_adapter(backend, src_adapter_mac: str) -> str | None:
     return local_adapters[0]
 
 
-def _write_cloned_keys(backend, chosen_dev: UnifiedDevice, target_mac: str, target_adapter: str, target_dir: Path) -> None:
+def _write_cloned_keys(backend: LinuxBluetoothBackend, chosen_dev: UnifiedDevice, target_mac: str, target_adapter: str, target_dir: Path) -> None:
     """Writes Classic and/or BLE keys to BlueZ directory for cloned device."""
     if chosen_dev.classic_bond:
         cb = chosen_dev.classic_bond
@@ -82,7 +83,7 @@ def run_unified_clone_flow() -> None:
     """Clones a device from source (Windows/Linux) automatically handling BLE/Classic/Both."""
     tui.header("Clone Device — Step 1: System detection")
     env, backend = common.detect_and_validate()
-    if env.os_kind != OSKind.LINUX:
+    if env.os_kind != OSKind.LINUX or not isinstance(backend, LinuxBluetoothBackend):
         tui.err("Cloning is only supported on Linux.")
         return
 
@@ -118,7 +119,12 @@ def run_unified_clone_flow() -> None:
     tui.header("Clone Device — Step 4: Destination MAC & Adapter")
     target_mac = tui.ask("Destination MAC (Enter to keep original)", default=chosen_dev.mac)
 
-    src_adapter = (chosen_dev.ble_bond or chosen_dev.classic_bond).adapter_mac
+    bond = chosen_dev.ble_bond or chosen_dev.classic_bond
+    if not bond:
+        tui.err("No bonding keys found for this device.")
+        return
+
+    src_adapter = bond.adapter_mac
     target_adapter = _resolve_target_adapter(backend, src_adapter)
     if not target_adapter:
         return
@@ -157,4 +163,4 @@ def run_unified_clone_flow() -> None:
     if chosen_dev.classic_bond:
         tui.warn_classic_post_import(target_mac)
 
-    verify_and_connect(backend, target_mac)
+    force_push_sync(backend, target_mac)

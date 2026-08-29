@@ -1,9 +1,10 @@
-"""actions_verify.py — Verify & Connect flow: bluetoothctl info + connect with log."""
+"""actions_verify.py — Verify & Connect and Force Push Sync flows."""
 
 from __future__ import annotations
 
 import configparser
 import subprocess
+import time
 from pathlib import Path
 from platform_detect import OSKind
 import tui_helpers as tui
@@ -79,10 +80,7 @@ def verify_and_connect(backend, mac: str) -> None:
     success = connected == "yes"
     if not success:
         try:
-            proc = subprocess.run(
-                ["bluetoothctl", "connect", mac],
-                capture_output=True, text=True, timeout=18
-            )
+            proc = subprocess.run(["bluetoothctl", "connect", mac], capture_output=True, text=True, timeout=18)
             connect_log = proc.stdout or proc.stderr
             success = "Connection successful" in connect_log or "Connection: yes" in connect_log
         except subprocess.TimeoutExpired:
@@ -90,11 +88,9 @@ def verify_and_connect(backend, mac: str) -> None:
         except Exception as exc:
             connect_log = f"Error launching bluetoothctl: {exc}"
 
-    ok = tui.green
-    bad = tui.red
-    paired_c  = ok(paired)  if paired  == "yes" else bad(paired)
-    bonded_c  = ok(bonded)  if bonded  == "yes" else bad(bonded)
-    trusted_c = ok(trusted) if trusted == "yes" else bad(trusted)
+    paired_c = tui.green(paired) if paired == "yes" else tui.red(paired)
+    bonded_c = tui.green(bonded) if bonded == "yes" else tui.red(bonded)
+    trusted_c = tui.green(trusted) if trusted == "yes" else tui.red(trusted)
     print(f"  Paired : {paired_c}   Bonded : {bonded_c}   Trusted : {trusted_c}")
 
     if connect_log:
@@ -123,7 +119,45 @@ def verify_and_connect(backend, mac: str) -> None:
             tui.info("Ensure the device was NOT power-cycled between export and import.")
         else:
             tui.warn("Could not connect. Device may be out of range or MAC rotated.")
-            tui.info("Tip: power-cycle the device then run [5] Verify from the menu.")
+            tui.info("Tip: power-cycle the device then run Force Push Sync from the menu.")
+
+
+def force_push_sync(backend, mac: str) -> None:
+    """Forces BlueZ daemon reload, cycles adapter power, unblocks/trusts device, and connects."""
+    tui.header(f"Force Push Sync & Reconnect — {mac}")
+    with tui.Spinner("1/3 Restarting Bluetooth daemon…"):
+        try:
+            backend.restart_bluetooth_stack()
+        except Exception as e:
+            tui.warn(f"Restart daemon warning: {e}")
+
+    with tui.Spinner("2/3 Cycling adapter and unblocking device…"):
+        subprocess.run(["bluetoothctl", "power", "off"], capture_output=True, timeout=5)
+        time.sleep(1)
+        subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=5)
+        subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True, timeout=5)
+        subprocess.run(["bluetoothctl", "unblock", mac], capture_output=True, timeout=5)
+        subprocess.run(["bluetoothctl", "trust", mac], capture_output=True, timeout=5)
+
+    tui.info("3/3 Attempting connection…")
+    verify_and_connect(backend, mac)
+
+
+def run_force_push_sync_flow() -> None:
+    """Menu flow: pick a bonded device and force push sync / reconnect."""
+    tui.header("Force Push Sync — Step 1: System detection")
+    env, backend = common.detect_and_validate()
+    if env.os_kind != OSKind.LINUX:
+        tui.err("Force Push Sync is only supported on Linux.")
+        return
+    tui.header("Force Push Sync — Step 2: Choose device")
+    with tui.Spinner("Scanning bonded devices…"):
+        devices = backend.list_devices()
+    chosen = common.prompt_select_device(devices) if devices else None
+    if not chosen:
+        tui.info("No device selected.")
+        return
+    force_push_sync(backend, chosen.device_mac)
 
 
 def run_verify_flow() -> None:
@@ -141,4 +175,3 @@ def run_verify_flow() -> None:
         tui.info("No device selected.")
         return
     verify_and_connect(backend, chosen.device_mac)
-

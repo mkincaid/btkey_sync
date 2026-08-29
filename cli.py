@@ -15,7 +15,7 @@ import sys
 from platform_detect import OSKind, gather_environment_info
 import tui_helpers as tui
 from actions import run_export_flow, run_import_flow
-from actions_verify import run_verify_flow
+from actions_verify import run_verify_flow, run_force_push_sync_flow
 from actions_remove import run_remove_flow
 from actions_show import run_show_keys_flow
 from actions_classic import run_classic_export_flow, run_classic_import_flow
@@ -24,9 +24,7 @@ from actions_clone import run_unified_clone_flow
 
 
 def _check_and_advise_sudo() -> None:
-    if os.name != "posix":
-        return
-    if os.geteuid() == 0:
+    if os.name != "posix" or os.geteuid() == 0:
         return
 
     print(f"\n{tui.SEP2}")
@@ -59,9 +57,10 @@ def _print_main_menu() -> None:
     print(f"    {tui.cyan('[1]')}  {tui.bold('Clone Device')}         {tui.dim('— directly sync BLE, Classic or Dual-Mode')}")
     print(f"    {tui.cyan('[2]')}  {tui.bold('Export Key to File')}   {tui.dim('— save device keys to a .reg file')}")
     print(f"    {tui.cyan('[3]')}  {tui.bold('Import Key from File')} {tui.dim('— load device keys from a .reg file')}")
-    print(f"    {tui.cyan('[4]')}  {tui.bold('Remove Device')}        {tui.dim('— delete bonding from this OS')}")
-    print(f"    {tui.cyan('[5]')}  {tui.bold('Show Keys')}            {tui.dim('— display all bonding keys')}")
-    print(f"    {tui.cyan('[6]')}  {tui.bold('Device Help & Advice')} {tui.dim('— identify BLE vs Classic workflow')}")
+    print(f"    {tui.cyan('[4]')}  {tui.bold('Force Push Sync')}      {tui.dim('— force reload BlueZ, trust & reconnect')}")
+    print(f"    {tui.cyan('[5]')}  {tui.bold('Remove Device')}        {tui.dim('— delete bonding from this OS')}")
+    print(f"    {tui.cyan('[6]')}  {tui.bold('Show Keys')}            {tui.dim('— display all bonding keys')}")
+    print(f"    {tui.cyan('[7]')}  {tui.bold('Device Help & Advice')} {tui.dim('— identify BLE vs Classic workflow')}")
     print(f"    {tui.red('[q]')}  {tui.bold('Quit')}")
     print(tui.SEP2)
 
@@ -86,8 +85,8 @@ def run_interactive_menu() -> None:
                 run_unified_clone_flow()
             elif choice == "2":
                 print(f"\n  {tui.bold('Select Export Type:')}")
-                print(f"    1) BLE (Low Energy) Key")
-                print(f"    2) Classic (BR/EDR) Key")
+                print("    1) BLE (Low Energy) Key")
+                print("    2) Classic (BR/EDR) Key")
                 sub = tui.ask("Export type", default="1")
                 if sub == "1":
                     run_export_flow()
@@ -95,19 +94,22 @@ def run_interactive_menu() -> None:
                     run_classic_export_flow()
             elif choice == "3":
                 print(f"\n  {tui.bold('Select Import Type:')}")
-                print(f"    1) BLE (Low Energy) Key")
-                print(f"    2) Classic (BR/EDR) Key")
+                print("    1) BLE (Low Energy) Key")
+                print("    2) Classic (BR/EDR) Key")
                 sub = tui.ask("Import type", default="1")
                 if sub == "1":
                     run_import_flow()
                 elif sub == "2":
                     run_classic_import_flow()
             elif choice == "4":
-                run_remove_flow()
+                run_force_push_sync_flow()
+                tui.pause()
             elif choice == "5":
+                run_remove_flow()
+            elif choice == "6":
                 run_show_keys_flow()
                 tui.pause()
-            elif choice == "6":
+            elif choice == "7":
                 run_device_helper_flow(env.os_kind)
                 tui.pause()
             elif choice in ("q", "quit", "exit", ""):
@@ -131,11 +133,19 @@ def main() -> None:
         "--import", dest="import_file", metavar="FILE.reg",
         help="Non-interactive: import an already-exported .reg file.",
     )
+    parser.add_argument(
+        "--push-sync", dest="push_mac", metavar="MAC",
+        help="Non-interactive: force reload BlueZ stack, trust and reconnect to device MAC.",
+    )
     args = parser.parse_args()
 
     try:
         if args.import_file:
             run_import_flow(args.import_file)
+        elif args.push_mac:
+            _, backend = common.detect_and_validate()
+            from actions_verify import force_push_sync
+            force_push_sync(backend, args.push_mac)
         else:
             run_interactive_menu()
     except KeyboardInterrupt:
