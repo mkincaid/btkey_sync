@@ -35,6 +35,7 @@ py-modules = [
   "actions_classic",
   "actions_classic_extra",
   "actions_clone",
+  "actions_clone_loader",
   "actions_common",
   "actions_help",
   "actions_remove",
@@ -45,3 +46,8 @@ py-modules = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.pyright]
+include = ["."]
+extraPaths = ["."]
+

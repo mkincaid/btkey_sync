@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from backends import LinuxBluetoothBackend, WindowsBluetoothBackend
+from backends import BluetoothBackend, LinuxBluetoothBackend, WindowsBluetoothBackend
 from models import BondKey, DiscoveredDevice
-from platform_detect import OSKind, gather_environment_info
+from platform_detect import EnvironmentInfo, OSKind, gather_environment_info
 import tui_helpers as tui
 
 
-def get_backend(os_kind: OSKind, bluetooth_dir: Path | None = None):
+def get_backend(os_kind: OSKind, bluetooth_dir: Path | None = None) -> BluetoothBackend:
     if os_kind == OSKind.WINDOWS:
         return WindowsBluetoothBackend()
     if os_kind == OSKind.LINUX:
@@ -22,7 +23,7 @@ def get_backend(os_kind: OSKind, bluetooth_dir: Path | None = None):
 
 
 def detect_and_validate(os_kind_override: OSKind | None = None,
-                        bluetooth_dir: Path | None = None) -> tuple:
+                        bluetooth_dir: Path | None = None) -> tuple[EnvironmentInfo, BluetoothBackend]:
     env = gather_environment_info()
     effective_os = os_kind_override or env.os_kind
 
@@ -51,7 +52,6 @@ def detect_and_validate(os_kind_override: OSKind | None = None,
 def _detect_windows_mounts() -> list[str]:
     """Scans mounted filesystems to find potential Windows installations."""
     suggestions = []
-    # 1. Check actively mounted drives from /proc/mounts
     try:
         if Path("/proc/mounts").exists():
             for line in Path("/proc/mounts").read_text().splitlines():
@@ -63,15 +63,13 @@ def _detect_windows_mounts() -> list[str]:
     except Exception:
         pass
 
-    # 2. Check common mount directories if none found active
     if not suggestions:
         for common_dir in ("/mnt", "/media"):
             p = Path(common_dir)
             if p.exists():
                 for sub in p.iterdir():
-                    if sub.is_dir():
-                        if (sub / "Windows/System32").exists() or (sub / "windows/system32").exists():
-                            suggestions.append(str(sub))
+                    if sub.is_dir() and ((sub / "Windows/System32").exists() or (sub / "windows/system32").exists()):
+                        suggestions.append(str(sub))
     return suggestions
 
 
@@ -80,31 +78,31 @@ def prompt_source_os(running_os: OSKind) -> tuple[OSKind, Path | None]:
         return running_os, None
 
     print(f"\n  {tui.bold('Where do you want to extract bonding keys from?')}\n")
-    print(f"    {tui.cyan('[1]')}  {tui.bold('This Linux system')}  "
-          f"{tui.dim('(/var/lib/bluetooth — default)')}")
-    print(f"    {tui.cyan('[2]')}  {tui.bold('A mounted Windows partition')}  "
-          f"{tui.dim('(read HKLM registry hive from disk)')}")
-    print()
+    print(f"    {tui.cyan('[1]')}  {tui.bold('This Linux system')}  {tui.dim('(/var/lib/bluetooth — default)')}")
+    print(f"    {tui.cyan('[2]')}  {tui.bold('A mounted Windows partition')}  {tui.dim('(read HKLM registry hive from disk)')}\n")
 
     choice = tui.ask("Source", default="1")
     if choice == "2":
-        print(f"    reged / chntpw required (see REQUIREMENTS.md)")
+        print("    reged / chntpw required (see REQUIREMENTS.md)")
         mounts = _detect_windows_mounts()
-        default_mount = "/mnt/windows"
+        default_mount = mounts[0] if mounts else "/mnt/windows"
         if mounts:
             tui.info("Detected Windows partition(s) mounted at:")
             for m in mounts:
                 print(f"      • {tui.bold(m)}")
-            default_mount = mounts[0]
 
         mount = tui.ask("Mount point of the Windows partition", default=default_mount)
         mount_path = Path(mount)
         if not mount_path.exists():
             tui.err(f"Mount point not found: {mount_path}")
-            # Try to help user by listing storage blocks
             tui.info("Check partition list with 'lsblk' and mount it, e.g.:")
             print(f"    {tui.cyan('sudo mkdir -p /mnt/windows && sudo mount /dev/sdXN /mnt/windows')}")
             return running_os, None
+
+        if any((mount_path / f).exists() for f in ("hiberfil.sys", "HIBERFIL.SYS")):
+            tui.warn("Windows Fast-Startup (hibernation) file detected on this partition.")
+            tui.info("If key reading fails, disable Fast Startup in Windows via: powercfg /h off")
+
         return OSKind.WINDOWS, mount_path
 
     return running_os, None
@@ -113,12 +111,10 @@ def prompt_source_os(running_os: OSKind) -> tuple[OSKind, Path | None]:
 def prompt_select_device(devices: list[DiscoveredDevice]) -> DiscoveredDevice | None:
     print(f"\n  {tui.bold('Bonded BLE devices found:')}\n")
     for d in devices:
-        name     = d.device_name or tui.dim("(no name)")
+        name = d.device_name or tui.dim("(no name)")
         ltk_flag = tui.green("✓ LTK") if d.has_ltk else tui.red("✗ no LTK")
-        idx_str  = tui.cyan(f"[{d.index}]")
-        print(f"    {idx_str}  {name:<30}  "
-              f"{tui.dim('MAC=')}{d.device_mac}  "
-              f"{tui.dim('adapter=')}{d.adapter_mac}  {ltk_flag}")
+        idx_str = tui.cyan(f"[{d.index}]")
+        print(f"    {idx_str}  {name:<30}  {tui.dim('MAC=')}{d.device_mac}  {tui.dim('adapter=')}{d.adapter_mac}  {ltk_flag}")
 
     print()
     while True:
@@ -186,8 +182,3 @@ def find_windows_system_hive(win_mount: Path | None) -> Path | None:
             if cfg_dir:
                 return next((cfg_dir / f for f in os.listdir(cfg_dir) if f.lower() == "system" and (cfg_dir / f).is_file()), None)
     return None
-
-
-
-# Windows-partition helpers live in actions_windows to keep this file under 200 lines.
-from actions_windows import run_offline_windows_export, pick_bond_from_windows  # noqa: E402

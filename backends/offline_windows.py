@@ -46,7 +46,7 @@ def detect_active_control_set(hive_path: Path) -> str:
     try:
         ok = _run_reged_export(hive_path, "HKEY_LOCAL_MACHINE\\SYSTEM", SELECT_SUBKEY, tmp_path)
         if ok:
-            text = tmp_path.read_text(encoding="utf-16-le", errors="ignore")
+            text = _read_reg_file(tmp_path)
             # Look for: "Current"=dword:00000001
             m = re.search(r'"Current"=dword:([0-9a-fA-F]+)', text)
             if m:

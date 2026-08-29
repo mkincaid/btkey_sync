@@ -1,4 +1,8 @@
-"""Linux (BlueZ) backend. Reads/writes directly in /var/lib/bluetooth/."""
+"""
+backends/linux_backend.py
+Linux (BlueZ) backend. Reads/writes directly in /var/lib/bluetooth/.
+Respects 200-line limit (AGENTS.md R14).
+"""
 
 from __future__ import annotations
 
@@ -6,13 +10,18 @@ import configparser, os, re, shutil, subprocess
 from pathlib import Path
 from typing import List, Optional
 
-from datetime import datetime, timezone
 from models import BondKey, DiscoveredDevice, LinkKeyBond
 from .base import BluetoothBackend
 from . import linux_classic as _classic
+from .linux_common import (
+    set_info_permissions, backup_info_file, remove_bond_directory,
+    restart_bluetooth_daemon, stop_bluetooth_daemon, start_bluetooth_daemon,
+    check_active_link, disable_discovery_if_active,
+)
 
 BLUETOOTH_DIR = Path("/var/lib/bluetooth")
 MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+
 
 class LinuxBluetoothBackend(BluetoothBackend):
     name = "linux"
@@ -37,16 +46,14 @@ class LinuxBluetoothBackend(BluetoothBackend):
         return [p.name for p in self.bluetooth_dir.iterdir() if p.is_dir() and MAC_RE.match(p.name)]
 
     def list_devices(self) -> List[DiscoveredDevice]:
-        devices = []
-        idx = 1
+        devices, idx = [], 1
         for adapter_mac in self._list_adapters():
             adapter_dir = self.bluetooth_dir / adapter_mac
             for device_path in adapter_dir.iterdir():
                 if not (device_path.is_dir() and MAC_RE.match(device_path.name)):
                     continue
                 info_path = device_path / "info"
-                has_ltk = False
-                device_name = None
+                has_ltk, device_name = False, None
                 if info_path.exists():
                     config = configparser.ConfigParser()
                     try:
@@ -55,10 +62,12 @@ class LinuxBluetoothBackend(BluetoothBackend):
                         device_name = config.get("General", "Name", fallback=None)
                     except configparser.Error:
                         pass
-                devices.append(DiscoveredDevice(
-                    index=idx, adapter_mac=adapter_mac, device_mac=device_path.name,
-                    device_name=device_name, has_ltk=has_ltk, raw_source_path=str(info_path)
-                ))
+                devices.append(
+                    DiscoveredDevice(
+                        index=idx, adapter_mac=adapter_mac, device_mac=device_path.name,
+                        device_name=device_name, has_ltk=has_ltk, raw_source_path=str(info_path),
+                    )
+                )
                 idx += 1
         return devices
 
@@ -72,10 +81,7 @@ class LinuxBluetoothBackend(BluetoothBackend):
         config.read(info_path)
 
         if "LongTermKey" not in config:
-            if "LinkKey" in config:
-                ltk_hex = config["LinkKey"].get("Key", "00" * 16)
-            else:
-                ltk_hex = "00" * 16
+            ltk_hex = config["LinkKey"].get("Key", "00" * 16) if "LinkKey" in config else "00" * 16
             ediv = erand = 0
         else:
             ltk_section = config["LongTermKey"]
@@ -91,14 +97,6 @@ class LinuxBluetoothBackend(BluetoothBackend):
             source_os="linux", irk_hex=irk_hex,
             is_le="LongTermKey" in config,
         )
-
-    def _backup_info(self, info_path: Path) -> None:
-        if not info_path.exists():
-            return
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup = info_path.with_name(f"info.bak-{ts}")
-        shutil.copy2(info_path, backup)
-        os.chmod(backup, 0o600)
 
     def import_bond_key(self, bond: BondKey, target_device_mac: Optional[str] = None,
                         source_device_mac: Optional[str] = None) -> Path:
@@ -116,14 +114,13 @@ class LinuxBluetoothBackend(BluetoothBackend):
         config.optionxform = str
 
         if info_path.exists():
-            self._backup_info(info_path)
+            backup_info_file(info_path)
             config.read(info_path)
             if "LinkKey" in config:
                 is_classic = True
         else:
             config["General"] = {
-                "Name": bond.device_name or "Imported Device",
-                "Manufacturer": "0",
+                "Name": bond.device_name or "Imported Device", "Manufacturer": "0",
                 "SupportedTechnologies": "BR/EDR;" if is_classic else "LE;",
                 "Trusted": "true", "Blocked": "false", "WakeAllowed": "true",
             }
@@ -139,99 +136,59 @@ class LinuxBluetoothBackend(BluetoothBackend):
         if bond.class_of_device is not None:
             config["General"]["Class"] = f"0x{bond.class_of_device:06x}"
 
+        techs = config["General"].get("SupportedTechnologies", "")
         if is_classic:
-            # Classic Bluetooth — enforce BR/EDR tech, preserve LE if already present
-            techs = config["General"].get("SupportedTechnologies", "")
-            if "LE;" in techs:
-                config["General"]["SupportedTechnologies"] = "BR/EDR;LE;"
-            else:
-                config["General"]["SupportedTechnologies"] = "BR/EDR;"
-            if "LinkKey" not in config:
-                config["LinkKey"] = {}
-            config["LinkKey"]["Key"] = bond.ltk_hex
-            if "Type" not in config["LinkKey"]:
-                config["LinkKey"]["Type"] = "4"
-            if "PINLength" not in config["LinkKey"]:
-                config["LinkKey"]["PINLength"] = "0"
+            config["General"]["SupportedTechnologies"] = "BR/EDR;LE;" if "LE;" in techs else "BR/EDR;"
+            config.setdefault("LinkKey", {})["Key"] = bond.ltk_hex
+            config["LinkKey"].setdefault("Type", "4")
+            config["LinkKey"].setdefault("PINLength", "0")
         else:
-            # BLE — enforce LE tech, preserve Classic if already present
-            techs = config["General"].get("SupportedTechnologies", "")
-            if "BR/EDR;" in techs or "LinkKey" in config:
-                config["General"]["SupportedTechnologies"] = "BR/EDR;LE;"
-            else:
-                config["General"]["SupportedTechnologies"] = "LE;"
-            if "LongTermKey" not in config:
-                config["LongTermKey"] = {}
-            config["LongTermKey"]["Key"] = bond.ltk_hex
-            config["LongTermKey"]["Authenticated"] = "0"
-            config["LongTermKey"]["EncSize"] = str(bond.key_length)
-            config["LongTermKey"]["EDiv"] = str(bond.ediv)
-            config["LongTermKey"]["Rand"] = str(bond.erand)
+            config["General"]["SupportedTechnologies"] = "BR/EDR;LE;" if ("BR/EDR;" in techs or "LinkKey" in config) else "LE;"
+            config.setdefault("LongTermKey", {})["Key"] = bond.ltk_hex
+            config["LongTermKey"].update({
+                "Authenticated": "0", "EncSize": str(bond.key_length),
+                "EDiv": str(bond.ediv), "Rand": str(bond.erand),
+            })
 
         if bond.irk_hex:
-            if "IdentityResolvingKey" not in config:
-                config["IdentityResolvingKey"] = {}
-            config["IdentityResolvingKey"]["Key"] = bond.irk_hex
+            config.setdefault("IdentityResolvingKey", {})["Key"] = bond.irk_hex
             config["IdentityResolvingKey"]["EncSize"] = "16"
 
         target_dir.mkdir(parents=True, exist_ok=True)
         with open(info_path, "w") as f:
             config.write(f, space_around_delimiters=False)
 
-        os.chmod(info_path, 0o600)
-        shutil.chown(info_path, user="root", group="root")
+        set_info_permissions(info_path)
         return info_path
 
     def restart_bluetooth_stack(self) -> None:
-        import time; subprocess.run(["systemctl", "restart", "bluetooth"], check=True)
-        for _ in range(10):
-            time.sleep(1)
-            r = subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, text=True)
-            if "succeeded" in r.stdout.lower() or "powered: yes" in r.stdout.lower(): break
+        restart_bluetooth_daemon()
 
     def verify_device(self, device_mac: str) -> str:
         res = subprocess.run(["bluetoothctl", "info", device_mac], capture_output=True, text=True)
         return res.stdout or res.stderr
 
     def remove_bond_key(self, adapter_mac: str, device_mac: str, remove_backups: bool = False) -> None:
-        target_dir = self.bluetooth_dir / adapter_mac / device_mac
-        if target_dir.exists() and target_dir.is_dir():
-            if not remove_backups:
-                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                try: shutil.copytree(target_dir, target_dir.with_name(f"{device_mac}.bak-{ts}"), dirs_exist_ok=True)
-                except Exception: pass
-            shutil.rmtree(target_dir)
-        if remove_backups and (self.bluetooth_dir / adapter_mac).exists():
-            for p in (self.bluetooth_dir / adapter_mac).iterdir():
-                if p.is_dir() and p.name.startswith(f"{device_mac}.bak-"):
-                    shutil.rmtree(p, ignore_errors=True)
+        remove_bond_directory(self.bluetooth_dir, adapter_mac, device_mac, remove_backups)
 
-    # ── Classic (BR/EDR) methods — delegates to linux_classic.py (RC9) ─────
-
+    # ── Classic delegates (RC9) ──────────────────────────────────────────
     def extract_classic_bond(self, device: DiscoveredDevice) -> LinkKeyBond:
-        """Extract a Classic bond from the BlueZ info file."""
         return _classic.extract_classic_bond(self.bluetooth_dir, device)
 
     def check_active_link(self, device_mac: str) -> bool:
-        """Return True if the device is currently connected (RC11)."""
-        return _classic.check_active_link(device_mac)
+        return check_active_link(device_mac)
 
     def write_classic_info(self, bond: LinkKeyBond, target_dir: Path) -> Path:
-        """Write a complete BlueZ info file for a Classic bond (RC3)."""
         return _classic.write_classic_info(bond, target_dir)
 
     def set_info_permissions(self, info_path: Path) -> None:
-        """Apply root ownership and 600 permissions to a BlueZ info file."""
-        _classic.set_info_permissions(info_path)
+        set_info_permissions(info_path)
 
     def stop_bluetooth(self) -> None:
-        """Stop the Bluetooth daemon (RC9 step a)."""
-        _classic.stop_bluetooth()
+        stop_bluetooth_daemon()
 
     def start_bluetooth(self) -> None:
-        """Start the Bluetooth daemon (RC9 step e)."""
-        _classic.start_bluetooth()
+        start_bluetooth_daemon()
 
     def disable_discovery_if_active(self) -> bool:
-        """Disable discovery scan only if currently active (RC12)."""
-        return _classic.disable_discovery_if_active()
+        return disable_discovery_if_active()

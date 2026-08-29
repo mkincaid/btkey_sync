@@ -2,35 +2,27 @@
 backends/linux_classic.py
 
 Discrete Classic (BR/EDR) backend operations for LinuxBluetoothBackend.
-Kept in a separate module to respect the 200-line limit (AGENTS.md R14).
-
-Each method is independently callable — they must NOT be collapsed into a
-single opaque 'sync' call (RC9). The CLI layer sequences them.
-
-RC10: This module uses the same systemctl / bluetoothctl calls already
-established in linux_backend.py — no second, different mechanism is introduced.
+Respects 200-line limit (AGENTS.md R14).
 """
 
 from __future__ import annotations
 
 import configparser
-import os
-import subprocess
-import time
 from pathlib import Path
 from typing import Optional
 
 from models import DiscoveredDevice, LinkKeyBond
+from .linux_common import (
+    set_info_permissions,
+    stop_bluetooth_daemon as stop_bluetooth,
+    start_bluetooth_daemon as start_bluetooth,
+    check_active_link,
+    disable_discovery_if_active,
+)
 
 
-# ── Extraction ──────────────────────────────────────────────────────────────
-
-def extract_classic_bond(bluetooth_dir: Path,
-                         device: DiscoveredDevice) -> LinkKeyBond:
-    """
-    Read [LinkKey], [General], and [DeviceID] from a BlueZ info file and
-    return a LinkKeyBond.  Raises FileNotFoundError or ValueError on bad data.
-    """
+def extract_classic_bond(bluetooth_dir: Path, device: DiscoveredDevice) -> LinkKeyBond:
+    """Read [LinkKey], [General], and [DeviceID] from BlueZ info file."""
     info_path = Path(device.raw_source_path)
     if not info_path.exists():
         raise FileNotFoundError(f"info file not found: {info_path}")
@@ -44,21 +36,21 @@ def extract_classic_bond(bluetooth_dir: Path,
 
     lk = cfg["LinkKey"]
     link_key_hex = lk.get("Key", "")
-    key_type   = int(lk.get("Type", "0"))
+    key_type = int(lk.get("Type", "0"))
     pin_length = int(lk.get("PINLength", "0"))
 
     gen = cfg["General"] if "General" in cfg else {}
-    device_class  = gen.get("Class", "")
-    device_name   = gen.get("Name", device.device_name)
-    raw_uuids     = gen.get("Services", "")
+    device_class = gen.get("Class", "")
+    device_name = gen.get("Name", device.device_name)
+    raw_uuids = gen.get("Services", "")
     service_uuids = [u for u in raw_uuids.split(";") if u.strip()]
 
     device_id: Optional[dict] = None
     if "DeviceID" in cfg:
         did = cfg["DeviceID"]
         device_id = {
-            "source":  did.get("Source",  ""),
-            "vendor":  did.get("Vendor",  ""),
+            "source": did.get("Source", ""),
+            "vendor": did.get("Vendor", ""),
             "product": did.get("Product", ""),
             "version": did.get("Version", ""),
         }
@@ -77,36 +69,8 @@ def extract_classic_bond(bluetooth_dir: Path,
     )
 
 
-# ── Connection check (RC11) ──────────────────────────────────────────────────
-
-def check_active_link(device_mac: str) -> bool:
-    """
-    Return True if bluetoothctl reports the device as currently connected.
-    Used before overwriting bonding state (RC11).
-    """
-    try:
-        res = subprocess.run(
-            ["bluetoothctl", "info", device_mac],
-            capture_output=True, text=True, timeout=8,
-        )
-        return "Connected: yes" in res.stdout
-    except Exception:
-        return False
-
-
-# ── Write complete info file (RC3) ───────────────────────────────────────────
-
 def write_classic_info(bond: LinkKeyBond, target_dir: Path) -> Path:
-    """
-    Write a COMPLETE BlueZ info file for a Classic bond.
-
-    All three sections ([General], [LinkKey], [DeviceID]) are written.
-    A partial file — e.g. only [LinkKey] — causes a silent
-    br-connection-page-timeout, NOT an authentication error. This has been
-    empirically confirmed (see CLASSIC_SUPPORT.agent.md §1, RC3).
-
-    [DeviceID] is only written when bond.device_id is not None.
-    """
+    """Write a complete BlueZ info file for a Classic bond (RC3)."""
     target_dir.mkdir(parents=True, exist_ok=True)
     info_path = target_dir / "info"
 
@@ -117,8 +81,7 @@ def write_classic_info(bond: LinkKeyBond, target_dir: Path) -> Path:
 
     if "General" not in cfg:
         cfg["General"] = {}
-    
-    # Set default values if not present
+
     cfg["General"]["Name"] = bond.device_name or cfg["General"].get("Name", "Imported Device")
     cfg["General"]["Class"] = bond.device_class or cfg["General"].get("Class", "0x000000")
     cfg["General"]["Trusted"] = "true"
@@ -134,15 +97,15 @@ def write_classic_info(bond: LinkKeyBond, target_dir: Path) -> Path:
         cfg["General"]["SupportedTechnologies"] = "BR/EDR;"
 
     cfg["LinkKey"] = {
-        "Key":       bond.link_key_hex,
-        "Type":      str(bond.key_type),
+        "Key": bond.link_key_hex,
+        "Type": str(bond.key_type),
         "PINLength": str(bond.pin_length),
     }
 
     if bond.device_id:
         cfg["DeviceID"] = {
-            "Source":  str(bond.device_id.get("source",  "")),
-            "Vendor":  str(bond.device_id.get("vendor",  "")),
+            "Source": str(bond.device_id.get("source", "")),
+            "Vendor": str(bond.device_id.get("vendor", "")),
             "Product": str(bond.device_id.get("product", "")),
             "Version": str(bond.device_id.get("version", "")),
         }
@@ -151,55 +114,3 @@ def write_classic_info(bond: LinkKeyBond, target_dir: Path) -> Path:
         cfg.write(f, space_around_delimiters=False)
 
     return info_path
-
-
-# ── Permissions (RC9 step d) ─────────────────────────────────────────────────
-
-def set_info_permissions(info_path: Path) -> None:
-    """Set ownership root:root and mode 600 on a BlueZ info file."""
-    import shutil
-    os.chmod(info_path, 0o600)
-    shutil.chown(info_path, user="root", group="root")
-
-
-# ── Daemon lifecycle (RC9 steps a, e) ────────────────────────────────────────
-
-def stop_bluetooth() -> None:
-    """Stop the Bluetooth daemon (same mechanism as restart_bluetooth_stack)."""
-    subprocess.run(["systemctl", "stop", "bluetooth"], check=True)
-
-
-def start_bluetooth() -> None:
-    """Start the Bluetooth daemon and wait until the adapter is powered on."""
-    subprocess.run(["systemctl", "start", "bluetooth"], check=True)
-    for _ in range(10):
-        time.sleep(1)
-        r = subprocess.run(
-            ["bluetoothctl", "power", "on"],
-            capture_output=True, text=True,
-        )
-        if "succeeded" in r.stdout.lower() or "powered: yes" in r.stdout.lower():
-            break
-
-
-# ── Discovery gate (RC9 step f, RC12) ────────────────────────────────────────
-
-def disable_discovery_if_active() -> bool:
-    """
-    Disable BT discovery scan ONLY if currently active (RC12).
-    Returns True if it was disabled, False if already off.
-    An active inquiry scan can obscure or interfere with a direct connect
-    attempt on BR/EDR devices.
-    """
-    try:
-        show = subprocess.run(
-            ["bluetoothctl", "show"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if "Discovering: yes" in show.stdout:
-            subprocess.run(["bluetoothctl", "scan", "off"],
-                           capture_output=True, timeout=5)
-            return True
-    except Exception:
-        pass
-    return False
