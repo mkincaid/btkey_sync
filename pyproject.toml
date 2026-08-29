@@ -1,5 +1,5 @@
 [project]
-name = "Btkey-Sync"
+name = "btkey-sync"
 version = "0.1.1"
 description = "Synchronize Bluetooth LE and Classic bond keys between Windows and Linux in dual-boot setups"
 readme = "README.md"
