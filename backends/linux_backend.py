@@ -16,7 +16,7 @@ from . import linux_classic as _classic
 from .linux_common import (
     set_info_permissions, backup_info_file, remove_bond_directory,
     restart_bluetooth_daemon, stop_bluetooth_daemon, start_bluetooth_daemon,
-    check_active_link, disable_discovery_if_active,
+    check_active_link, disable_discovery_if_active, warn_if_unpowered,
 )
 
 BLUETOOTH_DIR = Path("/var/lib/bluetooth")
@@ -162,7 +162,7 @@ class LinuxBluetoothBackend(BluetoothBackend):
         return info_path
 
     def restart_bluetooth_stack(self) -> None:
-        restart_bluetooth_daemon()
+        warn_if_unpowered(*restart_bluetooth_daemon())
 
     def verify_device(self, device_mac: str) -> str:
         res = subprocess.run(["bluetoothctl", "info", device_mac], capture_output=True, text=True)
@@ -188,7 +188,7 @@ class LinuxBluetoothBackend(BluetoothBackend):
         stop_bluetooth_daemon()
 
     def start_bluetooth(self) -> None:
-        start_bluetooth_daemon()
+        warn_if_unpowered(*start_bluetooth_daemon())
 
     def disable_discovery_if_active(self) -> bool:
         return disable_discovery_if_active()
