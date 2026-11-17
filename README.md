@@ -127,3 +127,5 @@ python3 tests/test_parsing.py
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+<!-- GitHub integration check: safe to close this PR without merging. -->
