@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,24 +61,68 @@ def stop_bluetooth_daemon() -> None:
     subprocess.run(["systemctl", "stop", "bluetooth"], check=True)
 
 
-def start_bluetooth_daemon() -> None:
-    """Start BlueZ bluetooth daemon and wait for adapter to power on."""
+def _btctl(*args: str, timeout: float = 5) -> str:
+    """Run bluetoothctl and return combined stdout+stderr ('' on failure)."""
+    try:
+        r = subprocess.run(["bluetoothctl", *args], capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return f"bluetoothctl {' '.join(args)} failed: {exc}"
+    return (r.stdout or "") + (r.stderr or "")
+
+
+def _adapter_powered() -> bool:
+    """True only if BlueZ reports the default controller as Powered: yes."""
+    return "powered: yes" in _btctl("show").lower()
+
+
+def power_on_adapter(timeout_s: float = 30.0) -> tuple[bool, str]:
+    """Power on the default adapter after a daemon (re)start.
+
+    The adapter is not ready the instant systemd returns: bluetoothd may not
+    have registered the controller yet (btusb firmware load can take several
+    seconds), and it can come back rfkill soft-blocked or powered off. So we
+    retry until `bluetoothctl show` actually reports Powered: yes, clearing
+    any rfkill soft-block on each attempt.
+
+    Returns (ok, last_output); last_output explains a failure.
+    """
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while True:
+        if shutil.which("rfkill"):
+            try:
+                subprocess.run(["rfkill", "unblock", "bluetooth"], capture_output=True, timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        last = _btctl("power", "on").strip()
+        if _adapter_powered():
+            return True, last
+        if time.monotonic() >= deadline:
+            return False, last
+        time.sleep(1)
+
+
+def warn_if_unpowered(ok: bool, detail: str) -> None:
+    """Non-fatal: the bond is already written, so tell the user and carry on."""
+    if not ok:
+        print(
+            "\n[warning] Bluetooth adapter did not power on after the daemon restart.\n"
+            f"          Last bluetoothctl output: {detail or '(none)'}\n"
+            "          Try: rfkill list bluetooth ; sudo journalctl -u bluetooth -n 30",
+            file=sys.stderr,
+        )
+
+
+def start_bluetooth_daemon() -> tuple[bool, str]:
+    """Start BlueZ and wait for the adapter to power on. Returns (ok, detail)."""
     subprocess.run(["systemctl", "start", "bluetooth"], check=True)
-    for _ in range(10):
-        time.sleep(1)
-        r = subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, text=True)
-        if "succeeded" in r.stdout.lower() or "powered: yes" in r.stdout.lower():
-            break
+    return power_on_adapter()
 
 
-def restart_bluetooth_daemon() -> None:
-    """Restart BlueZ daemon and power on adapter."""
+def restart_bluetooth_daemon() -> tuple[bool, str]:
+    """Restart BlueZ and wait for the adapter to power on. Returns (ok, detail)."""
     subprocess.run(["systemctl", "restart", "bluetooth"], check=True)
-    for _ in range(10):
-        time.sleep(1)
-        r = subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, text=True)
-        if "succeeded" in r.stdout.lower() or "powered: yes" in r.stdout.lower():
-            break
+    return power_on_adapter()
 
 
 def check_active_link(device_mac: str) -> bool:
